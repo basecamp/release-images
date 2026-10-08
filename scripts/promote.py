@@ -366,12 +366,11 @@ def resolve():
     except Unreadable as e:
         die(f"{pkg['release']}: {e}")
     if current is not None:
-        same = current[0] == digest
-        summary(f"### {name} {tag}: already in {pkg['release']}\n\n"
-                f"`{current[0]}` ({'the edge digest' if same else 'differs from edge ' + digest}). "
-                "Nothing to promote; release tags are never overwritten.")
-        if not same:
-            print(f"::warning::{pkg['release']}:{tag} exists with another digest; not overwritten")
+        if current[0] != digest:
+            die(f"{pkg['release']}:{tag} already exists as {current[0]}, but {pkg['edge']}:{tag} is {digest}. "
+                "Release tags are write-once: release a new version instead.")
+        summary(f"### {name} {tag}: already promoted\n\n`{pkg['release']}:{tag}` is `{digest}`, the edge digest. "
+                "Nothing to do. (To finish a partly failed promotion, re-run that run's failed jobs.)")
         output(ready="false")
         return
     owner, repo = pkg["source"].split("/")
