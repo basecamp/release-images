@@ -27,7 +27,7 @@ with its own token. Only this repository can write the release package
    scans each package for `v*` tags whose edge image has every platform but whose release tag
    doesn't exist yet. For each one it starts a run named **Promote \<package\> \<tag\>**.
 4. **A reviewer approves** the run's deployment to `release-<package>`. The run then copies the
-   approved digest to the release image, signs it and attests it.
+   approved digest to the release image, signs it, and attests a record of the promotion.
 
 Not waiting for the scan: `gh workflow run promote.yml -R basecamp/release-images -f package=kamal -f tag=v2.13.0`.
 
@@ -50,14 +50,30 @@ nothing.
   tag (or created the release) can't be the only approver. GitHub enforces that in the source
   repository's own environments; here the run is started by the scan, so the job checks it itself
   and fails if needed. Another reviewer then re-runs the job and approves.
-- **Tags.** The exact version always (`v1.2.3`, and `1.2.3` where the package uses it). `latest`
-  and the series tags (`1.2`, `1`) move only when this is the highest release published so far
-  in that series, so approving an older release after a newer one never moves them back.
-  Prereleases (`v1.2.3-rc.1`, `v2.0.0.beta1`) get only their exact tags.
-- **Never overwrite.** A release tag that already exists with another digest stops the run.
+- **One publish per package at a time.** The publish job runs in a per-package concurrency group,
+  so its checks read the registry as it is when it writes. Waiting for approval doesn't hold it.
+- **Version tags are write-once.** Before writing `vX.Y.Z` (and `X.Y.Z` where the package uses it),
+  the job reads the existing tag. The same digest is skipped, so a re-run is harmless. Any other
+  digest stops the run before anything is written: release a new version instead.
+- **`latest` only moves forward.** It moves only for a non-prerelease that is at least every release
+  already in the package, so approving an older release after a newer one never moves it back.
+  The series tags (`1.2`, `1`) that once-campfire, writebook, once-campfire-rust and fizzy publish
+  follow the same rule within their series. Prereleases (`v1.2.3-rc.1`, `v2.0.0.beta1`) get only
+  their exact tags.
 - **Copy, verify, sign, attest.** `crane copy` keeps the digest, so the release index is the edge
-  index byte for byte. Every tag is then checked against the approved digest, signed with cosign
-  (keyless), and given a provenance attestation.
+  index byte for byte. Every tag is then checked against the approved digest and signed with cosign
+  (keyless). Last, the run attests a promotion record on the image: package, tag, index digest,
+  source repository and commit, the edge image, the tags set, and who approved.
+
+The decisions live in `scripts/promote.py` (`decide_tags`, `promotion_predicate`), with offline tests
+in `tests/`: `python3 -m unittest discover -s tests -v`.
+
+### Immutability: what enforces it
+
+This workflow enforces the write-once and forward-only rules. ghcr doesn't: anyone with admin on a
+package can still delete a tag or push over it directly. The promotion record is the check against
+that. A release image is genuine when its digest carries an attestation from this workflow whose
+record names that tag and the approvers you expect.
 
 ### Pending, rejected and failed promotions
 
@@ -68,10 +84,21 @@ nothing.
 ### Verifying a release image
 
 ```
-cosign verify ghcr.io/basecamp/kamal:v2.13.0 \
+gh attestation verify oci://ghcr.io/basecamp/<pkg>:<tag> --owner basecamp \
+  --signer-workflow basecamp/release-images/.github/workflows/promote.yml
+```
+
+It succeeds only for a digest this workflow promoted. Add `--format json` and read
+`.[].verificationResult.statement.predicate.buildDefinition.externalParameters` for the record: the
+package, the tag, the digest, the source repository and commit, and the approvers. Check that its
+`tag` is the tag you pulled.
+
+The cosign signature is there too:
+
+```
+cosign verify ghcr.io/basecamp/<pkg>:<tag> \
   --certificate-identity https://github.com/basecamp/release-images/.github/workflows/promote.yml@refs/heads/main \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-gh attestation verify oci://ghcr.io/basecamp/kamal:v2.13.0 --repo basecamp/release-images
 ```
 
 ## Adding a package
@@ -94,9 +121,14 @@ gh attestation verify oci://ghcr.io/basecamp/kamal:v2.13.0 --repo basecamp/relea
 
 ## Housekeeping
 
-- Every action is pinned by commit SHA, and crane by version and checksum.
+- Issues, wiki, projects and discussions are off. A failed scan or promotion surfaces through
+  GitHub Actions notifications (to whoever triggered the run, and to the environment's reviewers
+  for pending approvals); watch the repository's Actions to see them all.
+- Changes come through pull requests, which only collaborators can open, and land as merge commits.
+  Anyone who can change `promote.yml` or approve in its environments controls these releases, so
+  keep both sets small.
+- Every action is pinned by commit SHA (the repository requires it), and crane by version and
+  checksum.
 - GitHub turns off scheduled workflows in a public repository after 60 days without activity, and
   emails a warning first. If promotions stop appearing, run
   `gh workflow enable promote.yml -R basecamp/release-images`, or dispatch them by hand as above.
-- Changes to this repository come through pull requests. Anyone who can change `promote.yml` or
-  approve in its environments controls these releases, so keep both sets small.

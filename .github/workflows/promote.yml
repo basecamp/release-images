@@ -7,7 +7,7 @@ name: Promote
 #
 #   Promote (a dispatch with package and tag; the scan queues these): check the edge image,
 #   wait for a reviewer in release-<package>, then copy that exact digest to the release
-#   image, sign it and attest it.
+#   image (version tags write-once, `latest` forward only), sign it and attest the promotion.
 #
 # See README.md.
 
@@ -99,6 +99,7 @@ jobs:
       ready: ${{ steps.resolve.outputs.ready }}
       environment: ${{ steps.resolve.outputs.environment }}
       digest: ${{ steps.resolve.outputs.digest }}
+      commit: ${{ steps.resolve.outputs.commit }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -133,20 +134,48 @@ jobs:
             "$EDGE@$DIGEST" > /dev/null
           echo "Signature verified: \`$IDENTITY\` at \`$COMMIT\`." | tee -a "$GITHUB_STEP_SUMMARY"
 
-  promote:
+  approve:
     name: Promote ${{ inputs.package }} ${{ inputs.tag }}
     needs: resolve
     if: ${{ needs.resolve.outputs.ready == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     # Waits here for a required reviewer. Admits only the default branch.
     environment: ${{ needs.resolve.outputs.environment }}
     permissions:
       contents: read # scripts/promote.py
-      actions: read # who approved this run, for the self-review check
+      actions: read # who approved this run, for the self-review check and the record
+    outputs:
+      approvers: ${{ steps.approve.outputs.approvers }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check who approved
+        id: approve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ inputs.package }}
+          TAG: ${{ inputs.tag }}
+        run: python3 scripts/promote.py approve
+
+  publish:
+    name: Publish ${{ inputs.package }} ${{ inputs.tag }}
+    needs: [resolve, approve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # One publish per package at a time, so the write-once check and the move of `latest`
+    # read the registry as it is when they write. Waiting for approval doesn't hold this.
+    concurrency:
+      group: publish-${{ inputs.package }}
+      cancel-in-progress: false
+    permissions:
+      contents: read # scripts/promote.py
       packages: write # the release package grants this repository Write
       id-token: write # keyless signature and attestation
-      attestations: write # provenance attestation
+      attestations: write # the promotion record
     env:
       PACKAGE: ${{ inputs.package }}
       TAG: ${{ inputs.tag }}
@@ -157,10 +186,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Plan the release tags
+      - name: Decide the release tags (write-once versions; latest only forward)
         id: plan
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/promote.py plan
 
       - name: Install crane
@@ -187,13 +214,14 @@ jobs:
           password: ${{ github.token }}
 
       - name: Copy the approved digest to the release image
+        if: ${{ steps.plan.outputs.write != '' }}
         env:
           EDGE: ${{ steps.plan.outputs.edge }}
           RELEASE: ${{ steps.plan.outputs.release }}
-          TAGS: ${{ steps.plan.outputs.tags }}
+          WRITE: ${{ steps.plan.outputs.write }}
         run: |
           set -euo pipefail
-          read -r -a tags <<<"$TAGS"
+          read -r -a tags <<<"$WRITE"
           # crane copy keeps the digest: the release index is byte for byte the edge index.
           crane copy "$EDGE@$DIGEST" "$RELEASE:${tags[0]}"
           for t in "${tags[@]:1}"; do crane tag "$RELEASE@$DIGEST" "$t"; done
@@ -208,9 +236,19 @@ jobs:
           RELEASE: ${{ steps.plan.outputs.release }}
         run: cosign sign --yes "$RELEASE@$DIGEST"
 
-      - name: Attest provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      - name: Write the promotion record
+        env:
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          APPROVERS: ${{ needs.approve.outputs.approvers }}
+          TAGS: ${{ steps.plan.outputs.tags }}
+          PREDICATE: ${{ runner.temp }}/promotion.json
+        run: python3 scripts/promote.py record
+
+      - name: Attest the promotion
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.plan.outputs.release }}
           subject-digest: ${{ needs.resolve.outputs.digest }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ runner.temp }}/promotion.json
           push-to-registry: true

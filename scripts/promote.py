@@ -5,8 +5,10 @@
            is missing, and drop the ones that already have a promote run (pending or failed)
   resolve  check one package+tag before it waits for approval: the environment, the edge
            index and its platforms, the source commit
-  plan     after approval: the self-review check, the immutability check and the tags to set
+  approve  after approval: who approved, and the self-review rule
+  plan     in the serialized publish job: the write-once check and the tags to set
   verify   every release tag now resolves to the approved digest
+  record   the promotion record attested on the release image
 
 Reads only: the GitHub API with the run's GITHUB_TOKEN, and ghcr.io anonymously (the edge
 and release packages are public). Writes nothing; promote.yml does the pushing.
@@ -212,33 +214,86 @@ def edge_index(reg, pkg, tag):
     return digest, sorted(set(pkg["platforms"]) - platforms(manifest))
 
 
-# ---------------------------------------------------------------- tags
+# ---------------------------------------------------------------- decisions (pure; tests/test_promote.py)
 
-def release_tags(pkg, tag, existing):
-    """The release tags to set for `tag`, given the tags the release package already has.
+class Refused(Exception):
+    pass
 
-    The exact version always. Moving tags (latest, X.Y, X) only for a non-prerelease that is
-    at least the highest release already published in that series, so approving an older
-    release after a newer one never moves them back.
+
+WRITE_ONCE = ("ref", "version")  # vX.Y.Z and X.Y.Z name one release, forever
+MOVING = ("latest", "minor", "major")  # move forward only
+
+
+def decide_tags(pkg, tag, digest, existing, digest_of):
+    """(write, skip) for promoting `digest` as `tag`, given the release package's tags now.
+
+    existing: the release package's tag names. digest_of(t): the digest tag t points at.
+
+    Version tags are write-once. One that exists with this digest is skipped (a re-run); one
+    that exists with any other digest refuses the whole promotion before anything is written.
+    `latest`, and the series tags `X.Y` and `X`, move only for a non-prerelease that is at
+    least every release already published (in that series), so they never move backwards.
     """
-    major, minor, patch, pre = parse(tag)
+    parsed = parse(tag)
+    if not parsed:
+        raise Refused(f"{tag!r} is not a release tag (v1.2.3, v1.2.3-rc.1, v2.0.0.beta1)")
+    if not pkg["tags"] or pkg["tags"][0] != "ref":
+        raise Refused('packages.json: "tags" must list "ref" first')
+    major, minor, patch, pre = parsed
     key = (major, minor, patch)
     released = [p[:3] for p in map(parse, existing) if p and not p[3]]
-    out = []
+    names = {"ref": tag, "version": tag[1:], "minor": f"{major}.{minor}", "major": f"{major}", "latest": "latest"}
+    forward = {
+        "latest": all(key >= r for r in released),
+        "minor": all(key >= r for r in released if r[:2] == key[:2]),
+        "major": all(key >= r for r in released if r[0] == major),
+    }
+    write, skip = [], []
     for kind in pkg["tags"]:
-        if kind == "ref":
-            out.append(tag)
-        elif kind == "version":
-            out.append(tag[1:])
-        elif pre:
-            continue
-        elif kind == "latest" and all(key >= r for r in released):
-            out.append("latest")
-        elif kind == "minor" and all(key >= r for r in released if r[:2] == key[:2]):
-            out.append(f"{major}.{minor}")
-        elif kind == "major" and all(key >= r for r in released if r[0] == major):
-            out.append(f"{major}")
-    return out
+        t = names[kind]
+        if kind in WRITE_ONCE:
+            current = digest_of(t) if t in existing else None
+            if current is None:
+                write.append(t)
+            elif current == digest:
+                skip.append(t)
+            else:
+                raise Refused(f"{t} already exists as {current}, not {digest}. Release tags are "
+                              "write-once: promote a new version instead.")
+        elif kind in MOVING:
+            if not pre and forward[kind]:
+                write.append(t)
+        else:
+            raise Refused(f"packages.json: unknown tag kind {kind!r}")
+    return write, skip
+
+
+def promotion_predicate(name, pkg, tag, digest, commit, approvers, tags, run_url, builder):
+    """SLSA v1 provenance recording one promotion. `gh attestation verify` checks this type by default."""
+    return {
+        "buildDefinition": {
+            "buildType": "https://github.com/basecamp/release-images/promotion/v1",
+            "externalParameters": {
+                "package": name,
+                "tag": tag,
+                "digest": digest,
+                "tags": tags,
+                "image": pkg["release"],
+                "source": {"repository": pkg["source"], "commit": commit, "workflow": pkg["workflow"],
+                           "image": f"{pkg['edge']}@{digest}"},
+                "approvers": approvers,
+            },
+            "internalParameters": {},
+            "resolvedDependencies": [
+                {"uri": f"git+https://github.com/{pkg['source']}@refs/tags/{tag}", "digest": {"gitCommit": commit}},
+                {"uri": f"oci://{pkg['edge']}", "digest": {"sha256": digest.split(":", 1)[1]}},
+            ],
+        },
+        "runDetails": {
+            "builder": {"id": builder},
+            "metadata": {"invocationId": run_url},
+        },
+    }
 
 
 # ---------------------------------------------------------------- commands
@@ -358,40 +413,66 @@ def resolve():
            edge=pkg["edge"], release=pkg["release"])
 
 
-def plan():
-    name, tag, digest = (os.environ.get(k) or "" for k in ("PACKAGE", "TAG", "DIGEST"))
+def approve():
+    """After approval, in the environment job: who approved, and the self-review rule."""
+    name, tag = os.environ.get("PACKAGE") or "", os.environ.get("TAG") or ""
     pkg = package(name)
-    if not parse(tag) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        die("bad tag or digest")
-    if environment(f"release-{name}"):
+    env_name = f"release-{name}"
+    run_id = os.environ["GITHUB_RUN_ID"]
+    approvals = gh(f"/repos/{REPO}/actions/runs/{run_id}/approvals") or []
+    approvers = sorted({a["user"]["login"] for a in approvals if a.get("state") == "approved"
+                        and any(e.get("name") == env_name for e in a.get("environments", []))})
+    if not approvers:
+        die("no approval recorded for this run")
+    if environment(env_name):
         # This run was queued by github-actions[bot] (or dispatched by a person, whom GitHub
         # already stops from approving). Carry the source repository's rule across: the person
         # who pushed the tag or created the release may not be the only approver.
-        run_id = os.environ["GITHUB_RUN_ID"]
-        approvals = gh(f"/repos/{REPO}/actions/runs/{run_id}/approvals") or []
-        approvers = {a["user"]["login"] for a in approvals if a.get("state") == "approved"
-                     and any(e.get("name") == f"release-{name}" for e in a.get("environments", []))}
         q = urllib.parse.urlencode({"branch": tag, "per_page": 20})
         runs = (gh(f"/repos/{pkg['source']}/actions/workflows/{pkg['workflow']}/runs?{q}") or {}).get("workflow_runs", [])
         authors = {u["login"] for r in runs for u in (r.get("actor"), r.get("triggering_actor")) if u}
         if not runs:
             die(f"no {pkg['workflow']} run for {tag} in {pkg['source']}; cannot check who released it")
-        if not approvers:
-            die("no approval recorded for this run")
-        if approvers <= authors:
-            die(f"approved only by {', '.join(sorted(approvers))}, who started the {tag} build in "
+        if set(approvers) <= authors:
+            die(f"approved only by {', '.join(approvers)}, who started the {tag} build in "
                 f"{pkg['source']}. Another reviewer must approve: re-run this job.")
+    summary(f"Approved by {', '.join(approvers)}.")
+    output(approvers=",".join(approvers))
+
+
+def plan():
+    """In the serialized publish job: which tags to write, read from the registry right now."""
+    name, tag, digest = (os.environ.get(k) or "" for k in ("PACKAGE", "TAG", "DIGEST"))
+    pkg = package(name)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        die(f"bad digest {digest!r}")
     reg = Registry()
     existing = reg.tags(pkg["release"])
-    if tag in existing:
-        current = reg.manifest(pkg["release"], tag)
-        if current and current[0] != digest:
-            die(f"{pkg['release']}:{tag} already exists as {current[0]}; release tags are never overwritten")
-    tags = release_tags(pkg, tag, existing)
-    if not tags or tags[0] != tag:
-        die(f"packages.json: {name} must list \"ref\" first in its tags")
-    summary(f"Tags to set on `{pkg['release']}@{digest}`: " + ", ".join(f"`{t}`" for t in tags))
-    output(tags=" ".join(tags), edge=pkg["edge"], release=pkg["release"])
+    lookup = lambda t: (reg.manifest(pkg["release"], t) or (None,))[0]
+    try:
+        write, skip = decide_tags(pkg, tag, digest, existing, lookup)
+    except Refused as e:
+        die(str(e))
+    lines = [f"Release tags on `{pkg['release']}@{digest}`:"]
+    lines += [f"- `{t}`: write" for t in write] + [f"- `{t}`: already this digest, skipped" for t in skip]
+    summary("\n".join(lines))
+    output(write=" ".join(write), tags=" ".join(skip + write), edge=pkg["edge"], release=pkg["release"])
+
+
+def record():
+    """Write the promotion record (the attestation predicate) to $PREDICATE."""
+    name, tag, digest, commit, approvers, tags = (os.environ.get(k) or "" for k in
+                                                  ("PACKAGE", "TAG", "DIGEST", "COMMIT", "APPROVERS", "TAGS"))
+    pkg = package(name)
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    pred = promotion_predicate(
+        name=name, pkg=pkg, tag=tag, digest=digest, commit=commit,
+        approvers=[a for a in approvers.split(",") if a], tags=tags.split(),
+        run_url=f"{server}/{REPO}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}/attempts/{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
+        builder=f"{server}/{os.environ.get('GITHUB_WORKFLOW_REF', REPO + '/.github/workflows/' + WORKFLOW + '@refs/heads/main')}")
+    with open(os.environ["PREDICATE"], "w") as f:
+        json.dump(pred, f, indent=2)
+    print(json.dumps(pred["buildDefinition"]["externalParameters"], indent=2))
 
 
 def verify():
@@ -410,7 +491,7 @@ def verify():
 
 
 if __name__ == "__main__":
-    cmds = {"scan": scan, "resolve": resolve, "plan": plan, "verify": verify}
+    cmds = {"scan": scan, "resolve": resolve, "approve": approve, "plan": plan, "verify": verify, "record": record}
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
         die(f"usage: promote.py {'|'.join(cmds)}")
     cmds[sys.argv[1]]()
