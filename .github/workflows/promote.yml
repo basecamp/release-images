@@ -1,0 +1,216 @@
+name: Promote
+
+# Two kinds of run, told apart by the `tag` input:
+#
+#   Scan (schedule, or a dispatch without a tag): find v* tags whose edge image is complete
+#   and whose release tag is missing, and queue one promote run for each.
+#
+#   Promote (a dispatch with package and tag; the scan queues these): check the edge image,
+#   wait for a reviewer in release-<package>, then copy that exact digest to the release
+#   image, sign it and attest it.
+#
+# See README.md.
+
+run-name: >-
+  ${{ inputs.tag && format('Promote {0} {1}', inputs.package, inputs.tag)
+  || (inputs.package && format('Scan {0}', inputs.package) || 'Scan') }}
+
+on:
+  schedule:
+    # Every 15 minutes, off the top of the hour, when scheduled runs are most often delayed.
+    # A scan is a handful of API and registry reads, so a new release waits at most one
+    # interval before its approval request appears.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package (a key in packages.json). Empty scans them all.
+        type: string
+        required: false
+        default: ""
+      tag:
+        description: Release tag to promote, e.g. v1.2.3 (needs a package). Empty scans.
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+# One promote run per package+tag at a time: a second one waits, then finds the release
+# already there. Scans never overlap, so two scans cannot queue the same tag.
+concurrency:
+  group: ${{ inputs.tag && format('promote-{0}-{1}', inputs.package, inputs.tag) || 'scan' }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan
+    if: ${{ !inputs.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # scripts/promote.py
+      actions: read # promote runs already pending or failed are not queued again
+    outputs:
+      queue: ${{ steps.scan.outputs.queue }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan
+        id: scan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ inputs.package }}
+        run: python3 scripts/promote.py scan
+
+  queue:
+    name: Queue promote runs
+    needs: scan
+    if: ${{ needs.scan.outputs.queue != '' && needs.scan.outputs.queue != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # dispatch one promote run per release
+    steps:
+      - name: Queue promote runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE: ${{ needs.scan.outputs.queue }}
+        run: |
+          set -euo pipefail
+          jq -r '.[] | [.package, .tag] | @tsv' <<<"$QUEUE" | while IFS=$'\t' read -r package tag; do
+            [[ "$package" =~ ^[a-z0-9][a-z0-9-]*$ && "$tag" =~ ^v[0-9A-Za-z.-]+$ ]] || { echo "::error::bad entry: $package $tag"; exit 1; }
+            gh workflow run promote.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f package="$package" -f tag="$tag"
+            echo "Queued $package $tag" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+  resolve:
+    name: Resolve ${{ inputs.package }} ${{ inputs.tag }}
+    if: ${{ inputs.tag != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # scripts/promote.py
+      actions: read # read the environment's protection rules
+    outputs:
+      ready: ${{ steps.resolve.outputs.ready }}
+      environment: ${{ steps.resolve.outputs.environment }}
+      digest: ${{ steps.resolve.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the edge image
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ inputs.package }}
+          TAG: ${{ inputs.tag }}
+        run: python3 scripts/promote.py resolve
+
+      - name: Install Cosign
+        if: ${{ steps.resolve.outputs.ready == 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Check the edge image was signed by the source build of this tag
+        if: ${{ steps.resolve.outputs.ready == 'true' }}
+        env:
+          EDGE: ${{ steps.resolve.outputs.edge }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          IDENTITY: ${{ steps.resolve.outputs.identity }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "$COMMIT" \
+            "$EDGE@$DIGEST" > /dev/null
+          echo "Signature verified: \`$IDENTITY\` at \`$COMMIT\`." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Promote ${{ inputs.package }} ${{ inputs.tag }}
+    needs: resolve
+    if: ${{ needs.resolve.outputs.ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Waits here for a required reviewer. Admits only the default branch.
+    environment: ${{ needs.resolve.outputs.environment }}
+    permissions:
+      contents: read # scripts/promote.py
+      actions: read # who approved this run, for the self-review check
+      packages: write # the release package grants this repository Write
+      id-token: write # keyless signature and attestation
+      attestations: write # provenance attestation
+    env:
+      PACKAGE: ${{ inputs.package }}
+      TAG: ${{ inputs.tag }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Plan the release tags
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/promote.py plan
+
+      - name: Install crane
+        env:
+          CRANE_VERSION: v0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/crane.tgz" \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  $RUNNER_TEMP/crane.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/crane.tgz" -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Copy the approved digest to the release image
+        env:
+          EDGE: ${{ steps.plan.outputs.edge }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          set -euo pipefail
+          read -r -a tags <<<"$TAGS"
+          # crane copy keeps the digest: the release index is byte for byte the edge index.
+          crane copy "$EDGE@$DIGEST" "$RELEASE:${tags[0]}"
+          for t in "${tags[@]:1}"; do crane tag "$RELEASE@$DIGEST" "$t"; done
+
+      - name: Verify every tag is the approved digest
+        env:
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: python3 scripts/promote.py verify
+
+      - name: Sign (keyless)
+        env:
+          RELEASE: ${{ steps.plan.outputs.release }}
+        run: cosign sign --yes "$RELEASE@$DIGEST"
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.plan.outputs.release }}
+          subject-digest: ${{ needs.resolve.outputs.digest }}
+          push-to-registry: true

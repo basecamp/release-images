@@ -1,0 +1,98 @@
+{
+  "fizzy": {
+    "source": "basecamp/fizzy",
+    "workflow": "publish-image.yml",
+    "edge": "ghcr.io/basecamp/fizzy-edge",
+    "release": "ghcr.io/basecamp/fizzy",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "tags": [
+      "ref",
+      "version",
+      "minor",
+      "major",
+      "latest"
+    ]
+  },
+  "once-campfire": {
+    "source": "basecamp/once-campfire",
+    "workflow": "publish-image.yml",
+    "edge": "ghcr.io/basecamp/once-campfire-edge",
+    "release": "ghcr.io/basecamp/once-campfire",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "tags": [
+      "ref",
+      "version",
+      "minor",
+      "major",
+      "latest"
+    ]
+  },
+  "writebook": {
+    "source": "basecamp/writebook",
+    "workflow": "publish-image.yml",
+    "edge": "ghcr.io/basecamp/writebook-edge",
+    "release": "ghcr.io/basecamp/writebook",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "tags": [
+      "ref",
+      "version",
+      "minor",
+      "major",
+      "latest"
+    ]
+  },
+  "once-campfire-rust": {
+    "source": "basecamp/once-campfire-rust",
+    "workflow": "publish-image.yml",
+    "edge": "ghcr.io/basecamp/once-campfire-rust-edge",
+    "release": "ghcr.io/basecamp/once-campfire-rust",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "tags": [
+      "ref",
+      "version",
+      "minor",
+      "major",
+      "latest"
+    ]
+  },
+  "kamal": {
+    "source": "basecamp/kamal",
+    "workflow": "docker-publish.yml",
+    "edge": "ghcr.io/basecamp/kamal-edge",
+    "release": "ghcr.io/basecamp/kamal",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "tags": [
+      "ref",
+      "latest"
+    ]
+  },
+  "kamal-skiff": {
+    "source": "basecamp/kamal-skiff",
+    "workflow": "docker-publish.yml",
+    "edge": "ghcr.io/basecamp/kamal-skiff-edge",
+    "release": "ghcr.io/basecamp/kamal-skiff",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "tags": [
+      "ref",
+      "latest"
+    ]
+  }
+}
